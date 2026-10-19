@@ -38,12 +38,59 @@ export interface Transactional extends Queryable {
   transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T>;
 }
 
+export type SslMode = "disable" | "require" | "no-verify" | "verify-full" | "prefer";
+
 export interface OpenOptions {
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
   readonly maxConnections?: number;
   readonly connectionTimeoutMs?: number;
+  readonly idleTimeoutMillis?: number;
   readonly statementTimeoutMs?: number;
   readonly applicationName?: string;
+  readonly ssl?: boolean | { rejectUnauthorized?: boolean };
+  readonly sslMode?: SslMode;
+}
+
+function resolveSsl(
+  connectionString: string,
+  options: OpenOptions,
+): boolean | { rejectUnauthorized?: boolean } | undefined {
+  if (options.ssl !== undefined) {
+    return options.ssl;
+  }
+
+  let mode = options.sslMode;
+  if (!mode) {
+    try {
+      const url = new URL(connectionString);
+      const queryMode = (
+        url.searchParams.get("sslmode") ?? url.searchParams.get("ssl")
+      )?.toLowerCase();
+      if (
+        queryMode === "no-verify" ||
+        queryMode === "require" ||
+        queryMode === "prefer" ||
+        queryMode === "verify-full" ||
+        queryMode === "disable"
+      ) {
+        mode = queryMode;
+      }
+    } catch {
+      // not a standard url
+    }
+  }
+
+  if (mode === "disable") {
+    return false;
+  }
+  if (mode === "no-verify" || mode === "require" || mode === "prefer") {
+    return { rejectUnauthorized: false };
+  }
+  if (mode === "verify-full") {
+    return { rejectUnauthorized: true };
+  }
+
+  return undefined;
 }
 
 export class Database implements Transactional {
@@ -52,16 +99,19 @@ export class Database implements Transactional {
   private constructor(private readonly pool: Pool) {}
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
+    const resolvedSsl = resolveSsl(connectionString, options);
     const config: PoolConfig = {
       connectionString,
       max: options.maxConnections ?? 10,
       connectionTimeoutMillis: options.connectionTimeoutMs ?? 10_000,
+      idleTimeoutMillis: options.idleTimeoutMillis ?? 30_000,
       // Named so `pg_stat_activity` says which process is holding a connection. During an
       // incident that is the difference between knowing and guessing.
       application_name: options.applicationName ?? "hyperion-backend",
       // A watcher query that has not finished in thirty seconds is wedged, not slow, and holding
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
+      ...(resolvedSsl !== undefined ? { ssl: resolvedSsl } : {}),
     };
     return new Database(new Pool(config));
   }

@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import { StellarRpc, StellarRpcError } from "../../src/chains/stellar/rpc.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import {
   FakeRpc,
@@ -319,5 +320,79 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("StellarRpc backoff and retries on 429/503", () => {
+  it("automatically retries on HTTP 429 and succeeds on eventual 200", async () => {
+    let attempts = 0;
+    const slept: number[] = [];
+    const mockFetch = () => {
+      attempts += 1;
+      if (attempts < 3) {
+        return Promise.resolve(
+          new Response("Too Many Requests", {
+            status: 429,
+            headers: { "retry-after": "1" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { sequence: 5_000_000, closeTime: 1234567, protocolVersion: 21 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    };
+
+    const rpc = new StellarRpc("https://soroban-testnet.stellar.org", {
+      fetch: mockFetch as unknown as typeof fetch,
+      sleep: (ms) => {
+        slept.push(ms);
+        return Promise.resolve();
+      },
+    });
+
+    const ledger = await rpc.latestLedger();
+    expect(ledger.sequence).toBe(5_000_000);
+    expect(attempts).toBe(3);
+    // Verified Retry-After of 1 second (1000ms) was honored
+    expect(slept).toEqual([1000, 1000]);
+  });
+
+  it("retries up to 3 times on 503 with exponential jittered backoff before throwing", async () => {
+    let attempts = 0;
+    const slept: number[] = [];
+    const mockFetch = () => {
+      attempts += 1;
+      return Promise.resolve(new Response("Service Unavailable", { status: 503 }));
+    };
+
+    const rpc = new StellarRpc("https://soroban-testnet.stellar.org", {
+      maxRetries: 3,
+      initialBackoffMs: 200,
+      maxBackoffMs: 5000,
+      fetch: mockFetch as unknown as typeof fetch,
+      sleep: (ms) => {
+        slept.push(ms);
+        return Promise.resolve();
+      },
+    });
+
+    await expect(rpc.latestLedger()).rejects.toThrow(StellarRpcError);
+    // Initial attempt + 3 retries = 4 requests total
+    expect(attempts).toBe(4);
+    expect(slept).toHaveLength(3);
+    // Jittered backoff stays within exponential ceiling bounds
+    expect(slept[0]).toBeGreaterThanOrEqual(0);
+    expect(slept[0]).toBeLessThanOrEqual(200);
+    expect(slept[1]).toBeGreaterThanOrEqual(0);
+    expect(slept[1]).toBeLessThanOrEqual(400);
+    expect(slept[2]).toBeGreaterThanOrEqual(0);
+    expect(slept[2]).toBeLessThanOrEqual(800);
   });
 });

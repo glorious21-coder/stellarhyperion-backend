@@ -43,6 +43,7 @@ export async function pendingForRail(
             t.destination_chain,
             t.nonce,
             t.origin_tx,
+            t.observed_at,
             a.status,
             COALESCE(a.check_failures, 0) AS check_failures,
             EXISTS (
@@ -73,6 +74,7 @@ export async function pendingForRail(
     status: readStatus(row.status === undefined ? null : textOrNull(row, "status")),
     checkFailures: integer(row, "check_failures"),
     delivered: row.delivered === true,
+    observedAt: row.observed_at ? new Date(row.observed_at as string | number | Date) : null,
   }));
 }
 

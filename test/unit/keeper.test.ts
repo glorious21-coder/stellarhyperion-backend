@@ -299,6 +299,138 @@ describe("keeper upkeep jobs", () => {
     expect(result.pending).toBe(1);
     expect(result.dryRun).toBe(true);
   });
+
+  it("submits addNativeGas transaction via evmRpcProvider and updates database", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "9",
+          origin_chain: "stellar-testnet",
+          destination_chain: "sepolia",
+          nonce: "78",
+          origin_tx: "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+          rail_reference: "0xmsg",
+          rail_status: "insufficient_gas",
+        },
+      ],
+    });
+
+    const calls: { address: string; functionName: string; args: readonly unknown[] }[] = [];
+    const evmRpcProvider = {
+      writeContract: (args: {
+        address: string;
+        functionName: string;
+        args: readonly unknown[];
+      }) => {
+        calls.push(args);
+        return Promise.resolve("0xtxhash123" as const);
+      },
+      waitForTransactionReceipt: () =>
+        Promise.resolve({
+          status: "success" as const,
+          blockNumber: 12345n,
+          transactionHash: "0xtxhash123" as const,
+        }),
+    };
+
+    const worker = new KeeperWorker(config, db, logger);
+    const result = await worker.processGasTopup({ evmRpcProvider });
+
+    expect(result.toppedUp).toBe(1);
+    expect(result.pending).toBe(1);
+    expect(result.dryRun).toBe(false);
+    expect(result.detail).toBe("topped up gas for 1 of 1 transfers");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.functionName).toBe("addNativeGas");
+    expect(calls[0]?.args[0]).toBe(
+      "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+    );
+
+    const updateQuery = db.executedQueries.find(
+      (q) => q.text.includes("UPDATE rail_attestation") && q.text.includes("gas_topped_up"),
+    );
+    expect(updateQuery).toBeDefined();
+    expect(updateQuery?.params).toContain(9n);
+  });
+
+  it("honors strict per-job spending limits when topping up Axelar transfers", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "10",
+          origin_chain: "stellar-testnet",
+          destination_chain: "sepolia",
+          nonce: "79",
+          origin_tx: "0x1111111111111111111111111111111111111111111111111111111111111111",
+          rail_reference: "0xmsg1",
+          rail_status: "insufficient_gas",
+        },
+        {
+          id: "11",
+          origin_chain: "stellar-testnet",
+          destination_chain: "sepolia",
+          nonce: "80",
+          origin_tx: "0x2222222222222222222222222222222222222222222222222222222222222222",
+          rail_reference: "0xmsg2",
+          rail_status: "not_enough_gas",
+        },
+      ],
+    });
+
+    let callsCount = 0;
+    const evmRpcProvider = {
+      writeContract: () => {
+        callsCount += 1;
+        return Promise.resolve("0xtopup" as const);
+      },
+      waitForTransactionReceipt: () =>
+        Promise.resolve({
+          status: "success" as const,
+          blockNumber: 12346n,
+          transactionHash: "0xtopup" as const,
+        }),
+    };
+
+    // Spending limit allows only 1 transfer of 100
+    const result = await processGasTopup(
+      { db, config, logger },
+      {
+        evmRpcProvider,
+        topupAmountPerTransfer: 100n,
+        maxSpendingLimit: 150n,
+      },
+    );
+
+    expect(callsCount).toBe(1);
+    expect(result.toppedUp).toBe(1);
+    expect(result.pending).toBe(2);
+  });
+
+  it("handles provider revert gracefully without bubbling uncaught error", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "12",
+          origin_chain: "stellar-testnet",
+          destination_chain: "sepolia",
+          nonce: "81",
+          origin_tx: "0x3333333333333333333333333333333333333333333333333333333333333333",
+          rail_reference: "0xmsg3",
+          rail_status: "insufficient_gas",
+        },
+      ],
+    });
+
+    const evmRpcProvider = {
+      writeContract: () => Promise.reject(new Error("RPC execution reverted")),
+    };
+
+    const result = await processGasTopup({ db, config, logger }, { evmRpcProvider });
+
+    expect(result.toppedUp).toBe(0);
+    expect(result.pending).toBe(1);
+  });
 });
 
 describe("KeeperWorker lifecycle and readiness", () => {

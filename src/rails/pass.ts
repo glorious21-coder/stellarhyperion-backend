@@ -22,6 +22,7 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeAttestation } from "../chains/writers.js";
+import { metricsRegistry } from "../metrics/registry.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
 import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
 
@@ -194,6 +195,13 @@ export class RailPass {
     }
 
     const { report } = lookup;
+    if (report.status === "attested" || report.attestedAt !== null) {
+      const attestedTime = report.attestedAt ? report.attestedAt.getTime() : at.getTime();
+      const observedTime = transfer.observedAt ? transfer.observedAt.getTime() : at.getTime();
+      const durationSeconds = Math.max(0, (attestedTime - observedTime) / 1000);
+      metricsRegistry.setRailAttestationDuration(this.options.client.rail, durationSeconds);
+    }
+
     await this.write(transfer, {
       status: report.status,
       railStatus: report.railStatus,

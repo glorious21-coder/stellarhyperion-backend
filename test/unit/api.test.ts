@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config/config.js";
 import type { Database } from "../../src/db/pool.js";
 import { buildServer } from "../../src/http/server.js";
+import { metricsRegistry } from "../../src/metrics/registry.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
@@ -290,6 +291,39 @@ describe("REST API endpoints", () => {
     expect(metrics.claims.unsettled).toBe(2);
     expect(metrics.railAttestations.attested).toBe(15);
     expect(metrics.cursors).toHaveLength(1);
+  });
+
+  it("exports Prometheus metrics for watcher block lag and rail attestation duration", async () => {
+    metricsRegistry.reset();
+    metricsRegistry.setWatcherBlockLag("sepolia", 4);
+    metricsRegistry.setWatcherBlockLag("stellar-testnet", 1);
+    metricsRegistry.setRailAttestationDuration("cctp", 42.5);
+
+    const db = new MockDb({});
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      readiness: [],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/metrics",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/plain");
+
+    const text = res.body;
+    expect(text).toContain("# HELP hyperion_watcher_block_lag");
+    expect(text).toContain("# TYPE hyperion_watcher_block_lag gauge");
+    expect(text).toContain('hyperion_watcher_block_lag{chain="sepolia"} 4');
+    expect(text).toContain('hyperion_watcher_block_lag{chain="stellar-testnet"} 1');
+
+    expect(text).toContain("# HELP hyperion_rail_attestation_duration_seconds");
+    expect(text).toContain("# TYPE hyperion_rail_attestation_duration_seconds gauge");
+    expect(text).toContain('hyperion_rail_attestation_duration_seconds{route="cctp"} 42.5');
   });
 
   it("serves transfer status by transfer id", async () => {

@@ -70,7 +70,12 @@ export interface RailSecondStepPayload {
 }
 
 export interface GasTopupPayload {
-  readonly limit?: number;
+  readonly limit?: number | undefined;
+  readonly evmRpcProvider?: MockEvmRpcProvider | undefined;
+  readonly gasServiceAddress?: string | undefined;
+  readonly refundAddress?: string | undefined;
+  readonly topupAmountPerTransfer?: bigint | undefined;
+  readonly maxSpendingLimit?: bigint | undefined;
 }
 
 export interface TtlBumpResult {

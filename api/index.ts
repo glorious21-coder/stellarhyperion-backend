@@ -7,13 +7,15 @@ import { buildServer } from "../src/http/server.js";
 import { createLogger } from "../src/logging/logger.js";
 
 let app: FastifyInstance | null = null;
+let db: Database | null = null;
 
 async function getApp(): Promise<FastifyInstance> {
   if (app) return app;
 
   process.env.HYPERION_NETWORK ??= "testnet";
   process.env.HYPERION_DEPLOYMENTS_FILE ??= resolvePath(process.cwd(), "deployments/testnet.json");
-  process.env.DATABASE_URL ??= "postgres://hyperion:hyperion@127.0.0.1:5432/hyperion";
+  process.env.DATABASE_URL ??=
+    process.env.POSTGRES_URL ?? "postgres://hyperion:hyperion@127.0.0.1:5432/hyperion";
   process.env.REDIS_URL ??= "redis://127.0.0.1:6379";
   process.env.INDEXER_ENABLED ??= "false";
   process.env.RAILS_ENABLED ??= "false";
@@ -23,16 +25,20 @@ async function getApp(): Promise<FastifyInstance> {
   const logger = createLogger(config);
   const startedAt = new Date();
 
-  let db: Database;
-  try {
-    db = Database.open(config.databaseUrl, {
-      applicationName: "hyperion-vercel-api",
-      connectionTimeoutMs: 2000,
-    });
-  } catch {
-    db = Database.open("postgres://hyperion:hyperion@127.0.0.1:5432/hyperion", {
-      connectionTimeoutMs: 1000,
-    });
+  if (!db) {
+    try {
+      db = Database.open(config.databaseUrl, {
+        applicationName: "hyperion-vercel-api",
+        connectionTimeoutMs: 2000,
+        idleTimeoutMillis: 10_000,
+        sslMode: config.sslMode,
+      });
+    } catch {
+      db = Database.open("postgres://hyperion:hyperion@127.0.0.1:5432/hyperion", {
+        connectionTimeoutMs: 1000,
+        idleTimeoutMillis: 10_000,
+      });
+    }
   }
 
   app = buildServer({

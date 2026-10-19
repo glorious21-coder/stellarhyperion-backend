@@ -67,6 +67,54 @@ export interface EventSource {
 
 export interface StellarRpcOptions {
   readonly timeoutMs?: number;
+  readonly maxRetries?: number;
+  readonly initialBackoffMs?: number;
+  readonly maxBackoffMs?: number;
+  readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  readonly fetch?: typeof fetch;
+}
+
+function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header);
+  if (!Number.isNaN(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+  const date = Date.parse(header);
+  if (!Number.isNaN(date)) {
+    return Math.max(0, date - Date.now());
+  }
+  return null;
+}
+
+function calculateBackoff(attempt: number, initialMs: number, maxMs: number): number {
+  const exp = Math.min(maxMs, initialMs * Math.pow(2, attempt));
+  // Full jitter: decorrelated random interval between 0 and exp
+  return Math.floor(Math.random() * exp);
+}
+
+async function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new Error(String(signal.reason ?? "cancelled")),
+      );
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(
+        signal?.reason instanceof Error
+          ? signal.reason
+          : new Error(String(signal?.reason ?? "cancelled")),
+      );
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class StellarRpc {
@@ -135,50 +183,69 @@ export class StellarRpc {
   }
 
   private async call(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
-    const timeout = AbortSignal.timeout(this.options.timeoutMs ?? 20_000);
-    // Either the caller stopping us or the request taking too long ends the attempt. Without the
-    // timeout a hung connection holds a poller tick open forever, and the poller's whole promise is
-    // that one tick runs at a time.
-    const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
+    const maxRetries = this.options.maxRetries ?? 3;
+    const initialBackoffMs = this.options.initialBackoffMs ?? 200;
+    const maxBackoffMs = this.options.maxBackoffMs ?? 5000;
+    const sleep = this.options.sleep ?? defaultSleep;
+    const fetchFn = this.options.fetch ?? fetch;
 
-    let response: Response;
-    try {
-      response = await fetch(this.url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        signal: combined,
-      });
-    } catch (cause) {
-      const aborted = signal?.aborted === true;
-      throw new StellarRpcError(method, aborted ? "cancelled" : describe(cause), !aborted);
-    }
+    let attempt = 0;
+    for (;;) {
+      if (signal?.aborted) {
+        throw new StellarRpcError(method, "cancelled", false);
+      }
 
-    if (!response.ok) {
-      // 429 and 5xx are worth retrying. A 4xx that is not 429 means the request was wrong and
-      // retrying it will be wrong the same way.
-      const retryable = response.status === 429 || response.status >= 500;
-      throw new StellarRpcError(method, `http ${String(response.status)}`, retryable);
-    }
+      const timeout = AbortSignal.timeout(this.options.timeoutMs ?? 20_000);
+      const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
 
-    let body: RpcResponse;
-    try {
-      body = (await response.json()) as RpcResponse;
-    } catch (cause) {
-      throw new StellarRpcError(method, `response was not json: ${describe(cause)}`, true);
-    }
+      let response: Response;
+      try {
+        response = await fetchFn(this.url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+          signal: combined,
+        });
+      } catch (cause) {
+        const aborted = signal?.aborted === true;
+        throw new StellarRpcError(method, aborted ? "cancelled" : describe(cause), !aborted);
+      }
 
-    if (body.error !== undefined) {
-      const message = body.error.message ?? "unspecified";
-      // The one error worth recognising by content. It means the cursor or start ledger has fallen
-      // out of the node's retention window, which no amount of retrying fixes.
-      const outOfWindow = /ledger range|must be within/i.test(message);
-      throw new StellarRpcError(method, message, !outOfWindow);
+      if (!response.ok) {
+        const isRetryableStatus = response.status === 429 || response.status === 503;
+        if (isRetryableStatus && attempt < maxRetries) {
+          const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"));
+          const backoffMs =
+            retryAfterMs !== null
+              ? Math.min(maxBackoffMs, retryAfterMs)
+              : calculateBackoff(attempt, initialBackoffMs, maxBackoffMs);
+
+          attempt += 1;
+          await sleep(backoffMs, signal);
+          continue;
+        }
+
+        const retryable = response.status === 429 || response.status >= 500;
+        throw new StellarRpcError(method, `http ${String(response.status)}`, retryable);
+      }
+
+      let body: RpcResponse;
+      try {
+        body = (await response.json()) as RpcResponse;
+      } catch (cause) {
+        throw new StellarRpcError(method, `response was not json: ${describe(cause)}`, true);
+      }
+
+      if (body.error !== undefined) {
+        const message = body.error.message ?? "unspecified";
+        const outOfWindow = /ledger range|must be within/i.test(message);
+        throw new StellarRpcError(method, message, !outOfWindow);
+      }
+      if (body.result === undefined) {
+        throw new StellarRpcError(method, "response carried neither a result nor an error", true);
+      }
+      return body.result;
     }
-    if (body.result === undefined) {
-      throw new StellarRpcError(method, "response carried neither a result nor an error", true);
-    }
-    return body.result;
   }
 }
 
