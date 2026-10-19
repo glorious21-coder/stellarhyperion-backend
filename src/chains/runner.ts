@@ -25,6 +25,7 @@ import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
+import { metricsRegistry } from "../metrics/registry.js";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
@@ -63,6 +64,7 @@ export interface IndexerHandle {
 /** One pass is one `tick`, and the component reports its own health. */
 interface Pass extends ReadinessSource {
   readonly name: string;
+  readonly progress?: unknown;
   tick(signal: AbortSignal): Promise<boolean>;
 }
 
@@ -85,7 +87,21 @@ export class PolledWorker implements Worker {
       name: pass.name,
       intervalMs,
       logger,
-      tick: (signal) => pass.tick(signal),
+      tick: async (signal) => {
+        const result = await pass.tick(signal);
+        if (
+          pass.progress &&
+          typeof pass.progress === "object" &&
+          "behind" in pass.progress &&
+          typeof (pass.progress as { behind?: unknown }).behind === "number"
+        ) {
+          metricsRegistry.setWatcherBlockLag(
+            pass.name,
+            (pass.progress as { behind: number }).behind,
+          );
+        }
+        return result;
+      },
     });
   }
 
@@ -286,7 +302,7 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     confirmations: config.confirmations,
     reorgDepth: config.reorgDepth,
     logRange: config.logRange,
-    client: viemClient(config.rpcUrl),
+    client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
   });

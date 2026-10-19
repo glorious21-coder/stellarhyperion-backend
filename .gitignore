@@ -4,8 +4,6 @@ coverage/
 *.tsbuildinfo
 
 # Secrets. Only .env.example is ever committed, and it holds placeholders.
-.env
-.env.*
 !.env.example
 
 # Local deployment records copied out of the contracts repo.
@@ -21,7 +19,7 @@ deployments/*.json
 # Working state for whoever picks this up next. Never a deliverable.
 .task-checklist.md
 .vercel
-.env*
 branch_structure.json
 temp_auto_push.bat
 temp_interactive_push.bat
+config.bat

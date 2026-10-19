@@ -9,9 +9,15 @@ import type { Logger } from "pino";
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
+import { processGasTopup } from "./jobs/gas.js";
 import { processRailSecondStep } from "./jobs/second-step.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
-import type { RailSecondStepPayload, RailSecondStepResult } from "./types.js";
+import type {
+  GasTopupPayload,
+  GasTopupResult,
+  RailSecondStepPayload,
+  RailSecondStepResult,
+} from "./types.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
@@ -30,6 +36,10 @@ export class KeeperWorker implements ReadinessSource {
       { db: this.db, config: this.config, logger: this.logger },
       payload,
     );
+  }
+
+  async processGasTopup(payload: GasTopupPayload = {}): Promise<GasTopupResult> {
+    return processGasTopup({ db: this.db, config: this.config, logger: this.logger }, payload);
   }
 
   readiness(): ReadinessReport {

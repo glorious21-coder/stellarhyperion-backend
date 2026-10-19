@@ -7,11 +7,18 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { metricsRegistry } from "../../metrics/registry.js";
 import type { ServerDeps } from "../server.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
   const startedAt = deps.startedAt ?? new Date();
+
+  app.get("/metrics", async (_request, reply: FastifyReply) => {
+    return reply
+      .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+      .send(metricsRegistry.renderPrometheus());
+  });
 
   app.get("/v1/metrics", async (_request, reply: FastifyReply) => {
     // 1. Total outbound transfers

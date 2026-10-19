@@ -62,6 +62,7 @@ export interface EvmWatchConfig {
   readonly chain: ChainKey;
   readonly chainId: number;
   readonly rpcUrl: string;
+  readonly rpcUrls: readonly string[];
   readonly routerAddress: Hex;
   /** The block the router was deployed in, from the deployment record. */
   readonly startBlock: bigint;
@@ -100,11 +101,15 @@ export interface KeeperConfig {
   readonly evmPrivateKey: string | null;
 }
 
+export type SslMode = "disable" | "require" | "no-verify" | "verify-full" | "prefer";
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
   readonly http: { readonly host: string; readonly port: number };
   readonly databaseUrl: string;
+  readonly sslMode: SslMode;
+  readonly databaseSslMode: SslMode;
   readonly redisUrl: string;
   readonly network: NetworkMode;
   readonly deploymentsFile: string;
@@ -170,6 +175,17 @@ const DATABASE_URL: VarSpec = {
   required: true,
   printable: false,
   purpose: "Postgres connection string. docker compose publishes one on 127.0.0.1:5433.",
+};
+
+const DATABASE_SSL_MODE: EnumSpec<SslMode> = {
+  name: "DATABASE_SSL_MODE",
+  kind: "enum",
+  required: false,
+  fallback: "disable",
+  choices: ["disable", "require", "no-verify", "verify-full", "prefer"],
+  printable: true,
+  purpose:
+    "SSL mode for Postgres connections. Use no-verify or require for cloud serverless environments.",
 };
 
 const REDIS_URL: VarSpec = {
@@ -434,6 +450,17 @@ function rpcOverrideSpec(chain: ChainKey): VarSpec {
   };
 }
 
+function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
+  return {
+    name: `EVM_RPC_URLS_${envSuffixFor(chain)}`,
+    kind: "url",
+    protocols: ["http", "https"],
+    required: false,
+    printable: true,
+    purpose: `RPC endpoints for ${CHAINS[chain].name}, comma-separated. Defaults to EVM_RPC_URL_${envSuffixFor(chain)} or the chain registry entry.`,
+  };
+}
+
 /**
  * Read the environment and the deployment record, or explain why not.
  *
@@ -450,7 +477,38 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const logLevel = reader.choice(LOG_LEVEL);
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
-  const databaseUrl = reader.url(DATABASE_URL);
+  const databaseSpec = reader.has("DATABASE_URL")
+    ? DATABASE_URL
+    : reader.has("POSTGRES_URL")
+      ? { ...DATABASE_URL, name: "POSTGRES_URL" }
+      : DATABASE_URL;
+  const databaseUrl = reader.url(databaseSpec);
+
+  let sslMode: SslMode = "disable";
+  if (reader.has("DATABASE_SSL_MODE")) {
+    sslMode = reader.choice(DATABASE_SSL_MODE);
+  } else if (reader.has("POSTGRES_SSL_MODE")) {
+    sslMode = reader.choice({ ...DATABASE_SSL_MODE, name: "POSTGRES_SSL_MODE" });
+  } else if (databaseUrl !== "") {
+    try {
+      const parsed = new URL(databaseUrl);
+      const queryMode = (
+        parsed.searchParams.get("sslmode") ?? parsed.searchParams.get("ssl")
+      )?.toLowerCase();
+      if (
+        queryMode === "no-verify" ||
+        queryMode === "require" ||
+        queryMode === "prefer" ||
+        queryMode === "verify-full" ||
+        queryMode === "disable"
+      ) {
+        sslMode = queryMode;
+      }
+    } catch {
+      // not a valid URL
+    }
+  }
+
   const redisUrl = reader.url(REDIS_URL);
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
@@ -511,6 +569,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     logLevel,
     http: { host, port },
     databaseUrl,
+    sslMode,
+    databaseSslMode: sslMode,
     redisUrl,
     network,
     deploymentsFile: absoluteDeployments,
@@ -665,11 +725,21 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         continue;
       }
       const override = rpcOverrideSpec(chainKey);
-      const rpcUrl = reader.has(override.name) ? reader.url(override) : chain.defaultRpcUrl;
+      const urlsOverride = rpcUrlsOverrideSpec(chainKey);
+      let rpcUrls: readonly string[];
+      if (reader.has(urlsOverride.name)) {
+        rpcUrls = reader.urls(urlsOverride);
+      } else if (reader.has(override.name)) {
+        rpcUrls = reader.urls(override);
+      } else {
+        rpcUrls = [chain.defaultRpcUrl];
+      }
+      const rpcUrl = rpcUrls[0] ?? chain.defaultRpcUrl;
       evm.push({
         chain: chainKey,
         chainId: chain.chainId,
         rpcUrl,
+        rpcUrls,
         routerAddress: deployment.router,
         startBlock: BigInt(deployment.deployedAt.blockNumber),
         confirmations: chain.confirmations,
